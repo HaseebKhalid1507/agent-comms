@@ -9,13 +9,13 @@ import json
 import os
 import pwd
 import re
+import secrets
 import socket
 import sqlite3
 import stat
 import sys
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 
 HOME = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
@@ -436,7 +436,13 @@ def holders(claim, exclude=None):
 
 # ───────────────────────── hooks ─────────────────────────
 
-pending_calls = deque(maxlen=64)  # (tool, canon_input, sid, ts) for old hosts
+# Caller stamping: before_tool_call (which carries session_id) rewrites our own
+# tool calls to add a single-use random token; tool.call redeems it. Works on
+# any host with hook Modify support, can't be forged by the model (unguessable,
+# single-use, and the hook overwrites any value the model supplied), and can't
+# be confused by concurrent identical calls the way input matching could.
+STAMP_KEY = "_comms_caller"
+stamps = {}  # token -> (sid, ts)
 
 
 def canon(v):
@@ -488,7 +494,13 @@ def on_hook(ev):
         inp = ev.get("tool_input")
         set_peer(sid, state="busy", doing=summarize_tool(name, inp), doing_at=t, last_seen=t)
         if name.startswith(PLUGIN_ID + ":"):
-            pending_calls.append((name.split(":", 1)[1], canon(inp), sid, t))
+            for tok in [k for k, (_, ts) in stamps.items() if t - ts > 120]:
+                del stamps[tok]
+            tok = secrets.token_urlsafe(12)
+            stamps[tok] = (sid, t)
+            stamped = dict(inp) if isinstance(inp, dict) else {}
+            stamped[STAMP_KEY] = tok
+            return {"action": "modify", "input": stamped}
         return {"action": "continue"}
     if kind == "after_tool_call":
         return after_edit(sid, row, ev)
@@ -781,16 +793,14 @@ def tool_watch(me, args):
 TOOL_FNS = {"comms_who": tool_who, "comms_send": tool_send, "comms_status": tool_status, "comms_watch": tool_watch}
 
 
-def caller_of(name, params):
-    if "session_id" in params:
-        return params["session_id"]  # host >= feat/extension-session-context; null = worker
-    # Older host: match the before_tool_call that preceded this call.
-    want = canon(params.get("input"))
-    for i, (tool, inp, sid, ts) in enumerate(pending_calls):
-        if tool == name and inp == want and now() - ts < 60:
-            del pending_calls[i]
-            return sid
-    return None
+def caller_of(params):
+    """The calling session, or None (worker/subagent, or the hook didn't run)."""
+    inp = params.get("input")
+    tok = inp.pop(STAMP_KEY, None) if isinstance(inp, dict) else None
+    hit = stamps.pop(tok, None) if isinstance(tok, str) else None
+    if hit:
+        return hit[0]
+    return params.get("session_id")  # hosts that put it on tool.call; null = worker
 
 
 def on_tool_call(params):
@@ -798,7 +808,7 @@ def on_tool_call(params):
     fn = TOOL_FNS.get(name)
     if fn is None:
         raise ToolError(f"unknown tool {name}")
-    me = caller_of(name, params)
+    me = caller_of(params)
     if me:
         ensure_peer(me)
     return fn(me, params.get("input") or {})

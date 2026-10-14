@@ -44,9 +44,7 @@ The name is a placeholder.
 
 ## Requirements
 
-On SynapsCLI builds where `tool.call` carries `params.session_id` (`feat/extension-session-context`), the plugin uses that to identify the calling session.
-
-On older builds it matches each `tool.call` against the `before_tool_call` hook that came just before it, using the tool name and input. This is correct except when two sessions call the same tool with identical input at the same moment.
+Any Synaps build whose hooks carry `session_id` (0.10.x). The plugin finds out which session called its tool from the `before_tool_call` hook: for its own tools, the hook adds a single-use token to the input, and `tool.call` redeems it. No host changes are needed.
 
 ## For humans
 

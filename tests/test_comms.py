@@ -16,6 +16,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAIN = os.path.join(ROOT, "main.py")
+PLUGIN = "agent-comms"
 
 
 class FakeSession:
@@ -93,11 +94,14 @@ class Plugin:
         ev.update(kw)
         return self.call("hook.handle", ev)
 
-    def tool(self, name, sid, _legacy=False, **inp):
-        params = {"name": name, "input": inp}
-        if not _legacy:
-            params["session_id"] = sid
-        return self.call("tool.call", params)["content"]
+    def stamp(self, name, sid, inp):
+        """What the host does: before_tool_call, apply a modify, return the input tool.call gets."""
+        r = self.hook("before_tool_call", sid, tool_name=f"{PLUGIN}_{name}",
+                      tool_runtime_name=f"{PLUGIN}:{name}", tool_input=inp)
+        return r["input"] if r["action"] == "modify" else inp
+
+    def tool(self, name, sid, **inp):
+        return self.call("tool.call", {"name": name, "input": self.stamp(name, sid, inp)})["content"]
 
     def close(self):
         try:
@@ -246,14 +250,38 @@ class CommsTest(unittest.TestCase):
         self.assertIn("workers can't send", self.pl.tool("comms_send", None, to=self.callA, text="x"))
         self.assertIn("live session", self.pl.tool("comms_who", None))
 
-    def test_legacy_host_attribution_via_before_tool_call(self):
-        inp = {"to": self.callA, "text": "legacy", "ask": True}
-        self.pl.hook("before_tool_call", self.B.sid, tool_name="agent-comms_comms_send",
-                     tool_runtime_name="agent-comms:comms_send", tool_input=inp)
-        r = self.pl.call("tool.call", {"name": "comms_send", "input": inp})["content"]
-        self.assertIn(f"ask → {self.callA}", r)
-        settle()
-        self.assertEqual(self.A.events[-1]["sender"]["name"], self.callB)
+    def test_concurrent_identical_calls_attribute_correctly(self):
+        # Both sessions call comms_who() with identical input; the host runs
+        # both hooks before either tool.call, and the calls land out of order.
+        a = self.pl.stamp("comms_who", self.A.sid, {})
+        b = self.pl.stamp("comms_who", self.B.sid, {})
+        out_b = self.pl.call("tool.call", {"name": "comms_who", "input": b})["content"]
+        out_a = self.pl.call("tool.call", {"name": "comms_who", "input": a})["content"]
+        self.assertIn(f"{self.callB} (you)", out_b)
+        self.assertIn(f"{self.callA} (you)", out_a)
+
+    def test_stamp_cannot_be_forged_or_replayed(self):
+        # The model supplies its own token: the hook overwrites it.
+        inp = self.pl.stamp("comms_send", self.B.sid, {"to": self.callA, "text": "x", "_comms_caller": "forged"})
+        self.assertNotEqual(inp["_comms_caller"], "forged")
+        r = self.pl.call("tool.call", {"name": "comms_send", "input": dict(inp)})["content"]
+        self.assertIn(f"→ {self.callA}", r)
+        # Replaying the same token: single-use, so the caller is unknown.
+        r = self.pl.call("tool.call", {"name": "comms_send", "input": dict(inp)})["content"]
+        self.assertIn("workers can't send", r)
+        # No hook ran (e.g. it timed out) and the model forged a token.
+        r = self.pl.call("tool.call", {"name": "comms_send",
+                                       "input": {"to": self.callA, "text": "x", "_comms_caller": "guess"}})["content"]
+        self.assertIn("workers can't send", r)
+
+    def test_host_session_id_on_tool_call_still_works(self):
+        r = self.pl.call("tool.call", {"name": "comms_send", "session_id": self.B.sid,
+                                       "input": {"to": self.callA, "text": "via params"}})["content"]
+        self.assertIn(f"tell → {self.callA}", r)
+
+    def test_other_tools_are_not_modified(self):
+        r = self.pl.hook("before_tool_call", self.A.sid, tool_name="bash", tool_input={"command": "ls"})
+        self.assertEqual(r["action"], "continue")
 
     def test_broadcast_is_quiet(self):
         C = FakeSession(self.base, "20261014-000003-cccc")

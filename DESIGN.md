@@ -59,9 +59,13 @@ nothing. Session start appends a ~60-token primer to the system prompt once
   check. Busy: `<base>/sessions/<id>.turn` exists, else hook state.
 - **Doing:** `before_tool_call` (tool + short arg), `before_message`
   (prompt prefix, `share_prompts`), `on_message_complete` (turn end).
-- **Caller identity:** `tool.call` `params.session_id` (SynapsCLI
-  `feat/extension-session-context`). Older hosts: matched against the
-  `before_tool_call` that preceded the call (same tool + same input, FIFO).
+- **Caller identity:** `before_tool_call` carries `session_id`, so for our
+  own tools the hook returns `modify` with a single-use random token added
+  to the input (`_comms_caller`); `tool.call` redeems and strips it. No host
+  change needed. The model can't forge it (the hook overwrites any value it
+  supplies, and unknown tokens resolve to "no caller"), and concurrent
+  identical calls from two sessions can't be confused. If a host also puts
+  `params.session_id` on `tool.call`, that is used when no token is present.
 - **State:** one SQLite WAL file shared by every plugin process (daemon +
   standalone sessions).
 
