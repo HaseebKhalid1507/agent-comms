@@ -1,0 +1,35 @@
+{
+  "name": "agent-comms",
+  "version": "0.1.0",
+  "description": "Session awareness for Synaps: every live session sees the others (busy/idle, what they're doing, claims) and can message them. Asks wake the peer; FYIs arrive quietly.",
+  "author": "Haseeb Khalid / Jawz",
+  "license": "MIT",
+  "extension": {
+    "protocol_version": 1,
+    "runtime": "process",
+    "command": "python3",
+    "args": ["main.py"],
+    "permissions": [
+      "tools.register",
+      "session.lifecycle",
+      "privacy.llm_content",
+      "tools.intercept",
+      "tools.transform_output"
+    ],
+    "hooks": [
+      {"hook": "on_session_start"},
+      {"hook": "on_session_end"},
+      {"hook": "before_message"},
+      {"hook": "on_message_complete"},
+      {"hook": "before_tool_call"},
+      {"hook": "after_tool_call", "tool": "edit"},
+      {"hook": "after_tool_call", "tool": "write"}
+    ],
+    "config": [
+      {"key": "base_dir", "description": "Synaps base dir (registry in <base>/run, sessions in <base>/sessions)", "default": ""},
+      {"key": "db_path", "description": "SQLite state file (default <base>/agent-comms/comms.db)", "default": ""},
+      {"key": "share_prompts", "description": "Show the first 160 chars of each session's latest prompt to peers", "default": true},
+      {"key": "max_hops", "description": "Max messages per thread", "default": 6}
+    ]
+  }
+}
