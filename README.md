@@ -44,7 +44,9 @@ The name is a placeholder.
 
 ## Requirements
 
-Any Synaps build whose hooks carry `session_id` (0.10.x). The plugin finds out which session called its tool from the `before_tool_call` hook: for its own tools, the hook adds a single-use token to the input, and `tool.call` redeems it. No host changes are needed.
+Any Synaps build whose hooks carry `session_id` (0.10.x).
+
+To learn which session called one of its tools, the plugin prefers `tool.call` `params.session_id` ([SynapsCLI#227](https://github.com/HaseebKhalid1507/SynapsCLI/pull/227)). On builds that don't send it, the `before_tool_call` hook adds a single-use token to the plugin's own tool calls, and `tool.call` redeems it. The model can't forge the token and can't reuse one, and two sessions making identical calls at the same time can't be confused.
 
 ## For humans
 
