@@ -609,6 +609,22 @@ def resolve(to, me):
     raise ToolError(f"'{to}' is {'ambiguous' if hits else 'not a live session'}; candidates: {names}")
 
 
+def invisible_note(me, live):
+    """Say so when the caller has no registry card: peers can't list it, and
+    their asks and replies can't wake it. Empty while visible, and during the
+    grace window where a new session's first hook beats its registration."""
+    if not me or me in live:
+        return ""
+    row = peer(me)
+    if row is not None and now() - (row["first_seen"] or 0) < 30:
+        return ""
+    card_path = tilde(os.path.join(run_dir(), f"{me}.json"))
+    return (f"⚠ Other sessions can't see you: {card_path} is missing. They won't list you, "
+            "and their asks and replies to you can't wake you. Your session socket may still be up. "
+            "Cause seen so far: a `--continue` of this session that was refused because it was already "
+            "live elsewhere deleted the card (a SynapsCLI bug). Restarting the session writes a new card.")
+
+
 def tool_who(me, args):
     live = live_sessions(force=True)
     if args.get("thread"):
@@ -628,6 +644,9 @@ def tool_who(me, args):
         w = db().execute("SELECT COUNT(*) FROM watches WHERE watcher=?", (me,)).fetchone()[0]
         if w:
             out.append(f"(you have {w} watch(es) armed)")
+        note = invisible_note(me, live)
+        if note:
+            out.insert(0, note)
     return "\n".join(out)
 
 
@@ -697,8 +716,10 @@ def tool_send(me, args):
         note = " (couldn't reach their socket: delivered quietly)"
     mark(mid, woke)
     how = "woke them" if woke else "quiet: they see it next turn"
-    tail = "; their reply will wake you" if kind == "ask" and woke else ""
-    return f"#{mid} {kind} → {target['call']} ({how}){note}{tail}"
+    hidden = invisible_note(me, live_sessions())
+    tail = "; their reply will wake you" if kind == "ask" and woke and not hidden else ""
+    out = f"#{mid} {kind} → {target['call']} ({how}){note}{tail}"
+    return f"{out}\n{hidden}" if hidden else out
 
 
 def store(frm, frm_call, to_sid, to_call, kind, text, re_id, thread, hops):

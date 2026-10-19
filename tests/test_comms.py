@@ -306,6 +306,26 @@ class CommsTest(unittest.TestCase):
         self.assertTrue(any("claim 'daemon' is free" in t for t in texts), texts)
         self.assertIn("1 live session(s)", self.pl.tool("comms_who", self.B.sid))
 
+    def test_session_without_a_card_is_told_it_is_invisible(self):
+        out = self.pl.tool("comms_who", self.A.sid)
+        self.assertNotIn("can't see you", out)
+        # The card goes; the socket stays up (a refused --continue elsewhere).
+        os.unlink(self.A.reg)
+        import sqlite3
+        con = sqlite3.connect(os.path.join(self.base, "agent-comms", "comms.db"))
+        con.execute("UPDATE peers SET first_seen=first_seen-60 WHERE sid=?", (self.A.sid,))
+        con.commit()
+        con.close()
+        out = self.pl.tool("comms_who", self.A.sid)
+        self.assertTrue(out.startswith("⚠ Other sessions can't see you"), out)
+        self.assertIn(f"{self.A.sid}.json is missing", out)
+        r = self.pl.tool("comms_send", self.A.sid, to=self.callB, text="still there?", ask=True)
+        self.assertIn("woke them", r)
+        self.assertNotIn("their reply will wake you", r)
+        self.assertIn("can't see you", r)
+        self.assertIn("1 live session(s)", self.pl.tool("comms_who", self.B.sid))
+        self.assertNotIn("can't see you", self.pl.tool("comms_who", self.B.sid))
+
     def test_hook_latency(self):
         n = 300
         t = time.perf_counter()

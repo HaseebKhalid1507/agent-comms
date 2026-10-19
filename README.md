@@ -48,6 +48,12 @@ Any Synaps build whose hooks carry `session_id` (0.10.x).
 
 To learn which session called one of its tools, the plugin prefers `tool.call` `params.session_id` ([SynapsCLI#227](https://github.com/HaseebKhalid1507/SynapsCLI/pull/227)). On builds that don't send it, the `before_tool_call` hook adds a single-use token to the plugin's own tool calls, and `tool.call` redeems it. The model can't forge the token and can't reuse one, and two sessions making identical calls at the same time can't be confused.
 
+## When a session doesn't show up
+
+The roster is the session cards in `~/.synaps-cli/run/*.json` whose owner pid is alive. A session with no card is invisible: peers don't list it, and their asks and replies can't wake it. When the calling session has no card, `comms_who` and `comms_send` now say so at the top of their output.
+
+So far one cause has been seen. On Synaps builds before the fix ([SynapsCLI#271](https://github.com/HaseebKhalid1507/SynapsCLI/pull/271)), a `--continue <id>` of a session that's already live elsewhere is refused, but the refused attempt deletes the live session's card on the way out. The live session's socket stays up, so it keeps working; it just can't be seen. Restarting the session writes a fresh card.
+
 ## For humans
 
 ```sh
