@@ -795,7 +795,9 @@ class Peer:
         self.next_id = 0
         self.sent_sig, self.sent_at = None, 0.0
         self.backoff = 5.0
+        self.last_try = 0.0
         self.retired = False
+        self.nudge = threading.Event()  # cut a backoff short (stop, or the peer just proved it's alive)
         self.thread = threading.Thread(target=self.run, daemon=True, name=f"peer-{addr[0]}:{addr[1]}")
 
     @property
@@ -804,6 +806,7 @@ class Peer:
 
     def run(self):
         while not self.r.stop.is_set() and not self.retired:
+            self.last_try = time.time()
             try:
                 self.connect()
             except Exception as e:  # noqa: BLE001 - dial failures are expected and quiet
@@ -812,7 +815,8 @@ class Peer:
                     break
                 if not isinstance(e, (OSError, ProtocolError, ssl.SSLError)):
                     log("dial error", self.addr, type(e).__name__)
-                self.r.stop.wait(self.backoff)
+                self.nudge.wait(self.backoff)
+                self.nudge.clear()
                 self.backoff = min(60.0, self.backoff * 2)
                 continue
             self.backoff = 5.0
@@ -1284,6 +1288,26 @@ class Relay:
             except Exception as e:  # noqa: BLE001
                 log("local request error", type(e).__name__, e)
 
+    def outbound(self, host, ip, wait=0.6):
+        """The live outbound connection to host. If there is none but we hear
+        from it, nudge the dialer and give it a moment (still inside the
+        tool's 1 s budget)."""
+        end = time.monotonic() + wait
+        nudged = False
+        while True:
+            with self.state:
+                p = self.by_host.get(host)
+                if p is not None and p.up:
+                    return p
+                if not nudged:
+                    for q in self.peers.values():
+                        if q.addr[0] == ip and not q.up:
+                            q.backoff = 5.0
+                            q.nudge.set()
+                    nudged = True
+            if time.monotonic() >= end or self.stop.wait(0.05):
+                return p
+
     def op_stats(self):
         with self.state:
             up = sorted(self.by_host)
@@ -1301,16 +1325,16 @@ class Relay:
         host, rsid = to[1:].split("/", 1)
         with self.lock:
             row = core.db().execute(
-                "SELECT s.call, s.dnd, h.last_seen FROM net_sessions s JOIN net_hosts h ON h.host=s.host "
+                "SELECT s.call, s.dnd, h.last_seen, h.addr FROM net_sessions s JOIN net_hosts h ON h.host=s.host "
                 "WHERE s.host=? AND s.sid=?", (host, rsid)).fetchone()
         if row is None or time.time() - row["last_seen"] > self.conf["peer_timeout"]:
             return {"ok": False, "error": f"that session on {host} isn't live any more; nothing was sent"}
         call = f"{row['call']}@{host}"
-        with self.state:
-            peer = self.by_host.get(host)
+        peer = self.outbound(host, row["addr"])
         if peer is None or not peer.up:
-            return {"ok": False, "error": f"{host} is unreachable from here (last heard {core.ago(row['last_seen'])} ago); "
-                                          "nothing was sent"}
+            return {"ok": False, "error": f"{host} is unreachable from here: no outgoing connection (it was last "
+                                          f"heard {core.ago(row['last_seen'])} ago; still connecting, or a firewall "
+                                          f"on {host}); nothing was sent"}
         with self.lock:
             con = core.db()
             my = core.ensure_peer(me)
@@ -1386,6 +1410,11 @@ class Relay:
                     return
                 c = self.cands[addr] = {"kind": kind}
             c["until"] = None if c["kind"] == "static" else time.time() + 60
+            p = self.peers.get(addr)
+            if kind == "dialback" and p is not None and not p.up and time.time() - p.last_try > 1:
+                # It just authenticated to us, so it's up: dial back now, not after the backoff.
+                p.backoff = 5.0
+                p.nudge.set()
 
     def on_datagram(self, data, src):
         if len(data) != BEACON_LEN or data[:4] != BEACON_MAGIC:
@@ -1587,6 +1616,7 @@ class Relay:
             inbound = [s for _, s in self.inbound.values()]
         for p in peers:
             p.retired = True
+            p.nudge.set()
             p.close()
         for s in inbound:
             kick(s)
@@ -1730,13 +1760,15 @@ def _cli(a):
     if cfg is None:
         print("networking: off (default). Nothing listens, nothing is sent.")
         return 0
+    bcast = None
     try:
         ip, bcast, subnet = iface_info(cfg["interface"])
         where = f"{cfg['interface']} {ip}/{subnet.prefixlen}"
     except OSError:
         where = f"{cfg['interface'] or '(no interface set)'} (no IPv4 address)"
-    print(f"networking: on. host {cfg['host']}, {where}, port {cfg['port']}, "
-          f"beacon {'on' if cfg['beacon'] else 'off'}")
+    beacon = (f"beacon to {bcast}" if cfg["beacon"] and bcast else
+              "beacon off" if not cfg["beacon"] else "no broadcast on this interface")
+    print(f"networking: on. host {cfg['host']}, {where}, port {cfg['port']}, {beacon}")
     if cfg["peers"]:
         print("static peers: " + ", ".join(f"{i}:{p}" for i, p in cfg["peers"]))
     try:

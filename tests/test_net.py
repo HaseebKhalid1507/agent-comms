@@ -935,6 +935,18 @@ class LinkTests(unittest.TestCase):
                                  and f"{a.call}@alpha" in B.tool("comms_who", b.sid), 10))
         self.assertGreater(B.stats()["stats"].get("beacon_ok", 0), 0)
 
+    def test_send_works_as_soon_as_the_roster_shows(self):
+        """alpha starts first, its dial to bravo fails and backs off; bravo's
+        inbound connection makes alpha dial back at once."""
+        pa, pb = free_port(), free_port()
+        A = self.machine("alpha", pa, peers=[f"127.0.0.1:{pb}"])
+        time.sleep(0.7)
+        B = self.machine("bravo", pb, peers=[f"127.0.0.1:{pa}"])
+        a, b = A.session("20261115-350001-aaaa"), B.session("20261115-350002-bbbb")
+        self.assertTrue(wait_for(lambda: f"{b.call}@bravo" in A.tool("comms_who", a.sid), 10))
+        r = A.tool("comms_send", a.sid, to=f"{b.call}@bravo", text="right away", ask=True)
+        self.assertIn("woke them", r)
+
     def test_wrong_key_is_refused_quietly(self):
         pa, pc = free_port(), free_port()
         A = self.machine("alpha", pa, peers=[f"127.0.0.1:{pc}"], beacon_to=[f"127.0.0.1:{pc}"])

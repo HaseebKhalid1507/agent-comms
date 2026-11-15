@@ -170,9 +170,11 @@ peers and the source of an authenticated inbound connection (dial-back).
   (tested by replaying a recorded session). Each `msg` also carries a `gid`
   and `ts`; a seen `gid` is answered "dup" with no store and no wake, which
   makes retransmits safe.
-- Pre-auth limits: one absolute 5 s deadline over handshake + hello, 8
-  handshakes in flight, 2 per source address, and 5 failures in 60 s
-  throttle that address to one try per 10 s (a throttle, not a wall).
+- Pre-auth limits, checked in the accept loop before any thread starts:
+  one absolute 5 s deadline over handshake + hello, 8 handshakes in flight
+  (static peers and addresses that authenticated before are exempt), 2 per
+  source address, and 5 failures in 60 s throttle that address to one try
+  per 10 s (a throttle, not a wall).
 
 ### Naming, routing, anti-spam
 
@@ -220,3 +222,6 @@ peers and the source of an authenticated inbound connection (dial-back).
 - A damper on remote digest churn (a paired host can change its
   `(call, claims)` part once a second).
 - IPv6, multicast, more than one interface.
+- Availability against a keyless LAN device that rotates source addresses:
+  it can keep new, never-seen peers waiting (known peers are exempt). It
+  can't read, forge or replay.
