@@ -73,7 +73,8 @@ CALL_RE = re.compile(r"^[a-z0-9_-]{1,20}$")
 CLAIM_RE = re.compile(r"^[A-Za-z0-9._~/:+@-]{1,120}$")
 GID_RE = re.compile(r"^[0-9a-f]{32}$")
 # C0/C1 controls, zero-width and bidi overrides. \t and \n are handled per use.
-CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069"
+                     "\ufeff\ud800-\udfff]")
 EVENT_RE = re.compile(r"<(/?)(event)", re.IGNORECASE)
 
 BEACON = struct.Struct("!4sB8s4sHd12s")  # magic, ver, node, ip, port, ts, nonce
@@ -271,21 +272,39 @@ def open_beacon(kb, data):
     return {"node": node, "ip": socket.inet_ntoa(ip), "port": port, "ts": ts, "nonce": nonce}
 
 
+# Frames go through SSLSocket.write()/read() only, never send()/recv(): once
+# an SSLSocket is shut down or closed (possibly from another thread),
+# recv()/sendall() fall through to the plain TCP socket, while read()/write()
+# raise ValueError. So there is no plaintext path by construction.
+
+
 def send_frame(s, obj):
-    data = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
+    data = json.dumps(obj, separators=(",", ":")).encode()
     if len(data) > MAX_FRAME:
         raise ProtocolError("frame too large")
-    s.sendall(struct.pack("!I", len(data)) + data)
+    view = memoryview(struct.pack("!I", len(data)) + data)
+    while view:
+        view = view[s.write(view):]
 
 
 def recv_exact(s, n):
     buf = bytearray()
     while len(buf) < n:
-        chunk = s.recv(n - len(buf))
+        chunk = s.read(n - len(buf))
         if not chunk:
             raise ProtocolError("connection closed")
         buf += chunk
     return bytes(buf)
+
+
+def kick(s):
+    """Wake whatever thread is blocked on a TLS connection, from any thread:
+    the base-class TCP shutdown, which keeps the TLS object (SSLSocket.shutdown
+    would drop it and open the plaintext path)."""
+    try:
+        socket.socket.shutdown(s, socket.SHUT_RDWR)
+    except (OSError, ValueError):
+        pass
 
 
 def recv_frame(s):
@@ -542,12 +561,18 @@ def tables():
     return con
 
 
-_conf_cache = {"at": 0.0, "c": None}
+_conf_cache = {"id": None, "c": None}
 
 
 def conf():
-    if time.monotonic() - _conf_cache["at"] > 5.0:
-        _conf_cache.update(at=time.monotonic(), c=load_conf())
+    """net.json, re-parsed only when the file changes (inode, size, mtime)."""
+    try:
+        st = os.stat(conf_path())
+        ident = (st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        ident = None
+    if ident != _conf_cache["id"]:
+        _conf_cache.update(id=ident, c=load_conf())
     return _conf_cache["c"] or dict(DEFAULTS, peer_timeout=45.0)
 
 
@@ -648,28 +673,41 @@ def resolve_remote(to):
     raise core.ToolError(f"'{to}' is not a live session; on {host}: " + ", ".join(r["call"] for r in on_host))
 
 
+class RelayDown(Exception):
+    """The relay isn't there, or didn't take the whole request: nothing was sent."""
+
+
+class RelayPending(Exception):
+    """The relay took the request but didn't answer in time: it may still deliver."""
+
+
 def relay_call(req, wait=RELAY_WAIT):
-    """One JSON request/response with the relay over AF_UNIX, whole round
-    trip capped at `wait` seconds (TimeoutError past it)."""
+    """One JSON request/response with the relay over AF_UNIX, the whole round
+    trip capped at `wait` seconds."""
     end = time.monotonic() + wait
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(wait)
-        s.connect(sock_path())
-        s.sendall(json.dumps(req).encode() + b"\n")
-        s.shutdown(socket.SHUT_WR)
-        buf = b""
-        while True:
-            left = end - time.monotonic()
-            if left <= 0:
-                raise TimeoutError
-            s.settimeout(left)
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-            if len(buf) > MAX_FRAME:
-                raise ValueError("oversized relay reply")
-    return json.loads(buf)
+    sent = False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(wait)
+            s.connect(sock_path())
+            s.sendall(json.dumps(req).encode() + b"\n")
+            s.shutdown(socket.SHUT_WR)
+            sent = True
+            buf = b""
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError
+                s.settimeout(left)
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_FRAME:
+                    raise ValueError("oversized relay reply")
+        return json.loads(buf)
+    except (OSError, ValueError) as e:
+        raise (RelayPending if sent else RelayDown)(type(e).__name__) from None
 
 
 def send(me, my, target, kind, text, parent, urgent):
@@ -679,11 +717,12 @@ def send(me, my, target, kind, text, parent, urgent):
     extra = " (urgent doesn't cross machines)" if urgent else ""
     try:
         r = relay_call(req)
-    except TimeoutError:
+    except RelayPending:
         return (f"queued → {target['call']}: the relay didn't confirm within {RELAY_WAIT:.0f} s; "
                 f"you'll get a notice if it isn't delivered{extra}")
-    except (OSError, ValueError):
-        raise core.ToolError("the network relay isn't running (python3 main.py relay); nothing was sent") from None
+    except RelayDown:
+        raise core.ToolError("the network relay isn't running or is busy (python3 main.py relay); "
+                             "nothing was sent") from None
     if not r.get("ok"):
         raise core.ToolError(str(r.get("error") or "not delivered"))
     woke = bool(r.get("woke"))
@@ -785,10 +824,12 @@ class Peer:
             raw.bind((self.r.ip, 0))
             raw.settimeout(HELLO_TIMEOUT)
             raw.connect(self.addr)
-            tls = self.r.cctx.wrap_socket(raw)
+            tls = self.r.cctx.wrap_socket(raw, do_handshake_on_connect=False)
+            self.r.arm(tls)
+            tls.do_handshake()
             check_tls(tls)
             send_frame(tls, self.r.hello())
-            h = self.r.check_hello(recv_frame(tls))
+            h = self.r.check_hello(recv_frame(tls), self.addr[0])
         except BaseException as e:
             for s in (tls, raw):
                 if s is not None:
@@ -796,6 +837,8 @@ class Peer:
             if isinstance(e, SelfDial):
                 self.retired = True
             raise
+        finally:
+            self.r.disarm(tls)
         with self.r.state:
             other = self.r.by_host.get(h["host"])
             if other is not None and other is not self and other.up and other.node == h["node"]:
@@ -814,6 +857,7 @@ class Peer:
             if self.host and self.r.by_host.get(self.host) is self:
                 del self.r.by_host[self.host]
         if s is not None:
+            kick(s)
             try:
                 s.close()
             except OSError:
@@ -874,6 +918,9 @@ class Relay:
         self.udp_limit = Limiter(20, 50)
         self.throttle = Throttle()
         self.hs_slots = threading.BoundedSemaphore(8)
+        self.inflight = collections.Counter()  # handshakes in progress per source IP (≤ 2)
+        self.pending = {}                     # id(sock) -> (sock, absolute deadline)
+        self.clash = {}                       # ip -> time a peer there used my host label
         self.host_wakes = Window(*HOST_WAKES)
         self.host_inflow = Window(*HOST_INFLOW)
         self.roster_at = {}
@@ -888,10 +935,33 @@ class Relay:
         return {"t": "hello", "v": VERSION, "node": self.node.hex(), "host": self.host,
                 "port": self.port, "ts": time.time()}
 
-    def check_hello(self, f):
+    def arm(self, s):
+        """One absolute deadline over TLS handshake + hello (a per-recv timeout
+        alone lets a dribbling client hold a handshake slot forever)."""
+        with self.state:
+            self.pending[id(s)] = (s, time.monotonic() + HELLO_TIMEOUT)
+
+    def disarm(self, s):
+        with self.state:
+            self.pending.pop(id(s), None)
+
+    def kick_overdue(self):
+        t = time.monotonic()
+        with self.state:
+            for k, (s, deadline) in list(self.pending.items()):
+                if deadline < t:
+                    del self.pending[k]
+                    kick(s)
+                    self.stats["hs_deadline"] += 1
+
+    def check_hello(self, f, ip="?"):
         if f.get("t") != "hello" or f.get("v") != VERSION:
             raise ProtocolError("bad hello")
         host = f.get("host")
+        if host == self.host and isinstance(f.get("node"), str) and f["node"] != self.node.hex():
+            self.clash[ip] = time.time()
+            log(f"a relay at {ip} uses my host label '{host}'; set a distinct \"host\" in net.json")
+            raise ProtocolError("host label clash")
         if not valid_host(host) or host == self.host:
             raise ProtocolError("bad host label")
         try:
@@ -941,20 +1011,22 @@ class Relay:
             })
         return out[:MAX_SESSIONS]
 
-    def wake_text(self, sid, text):
-        return core.wake(sid, f"[comms] {text}")
+    def wake_text(self, sid, text, host):
+        """A wake caused by another machine: always attributed to it
+        (sender id "@host", sender_type agent), never to the user."""
+        return core.wake(sid, f"[comms] {text}", f"@{host}", f"agent-comms@{host}")
 
-    def notice(self, sid, kind, text):
+    def notice(self, sid, kind, text, host):
         row = core.peer(sid)
         if row is None:
             return
         mid = core.store("agent-comms", core.PLUGIN_ID, sid, row["call"], "tell", text, None, None, 0)
         if kind == "ask":
-            core.mark(mid, self.wake_text(sid, text))
+            core.mark(mid, self.wake_text(sid, text, host))
 
     def fire(self, w, what):
         core.db().execute("DELETE FROM net_watches WHERE id=?", (w["id"],))
-        self.wake_text(w["watcher"], f"watch fired: {what}")
+        self.wake_text(w["watcher"], f"watch fired: {what}", w["host"])
 
     def eval_watches(self, host, sessions):
         by_sid = {s["sid"]: s for s in sessions}
@@ -1038,8 +1110,10 @@ class Relay:
         key, rcall = f"@{host}/{frm}", f"{call}@{host}"
         with self.lock:
             con = core.db()
-            if con.execute("SELECT 1 FROM net_msgs WHERE gid=?", (gid,)).fetchone():
-                return ack("dup")
+            seen = con.execute("SELECT m.woke FROM net_msgs n LEFT JOIN messages m ON m.id=n.mid WHERE n.gid=?",
+                               (gid,)).fetchone()
+            if seen is not None:
+                return dict(ack("dup"), woke=bool(seen["woke"]))
             if self.host_inflow.full(host):
                 return ack("rej", "rate")
             self.host_inflow.add(host)
@@ -1090,25 +1164,38 @@ class Relay:
                 return
             with self.state:
                 allowed = self.throttle.allow(ip)
+                if allowed and self.inflight[ip] >= 2:
+                    allowed = False
+                if allowed:
+                    self.inflight[ip] += 1
             if not allowed:
                 self.stats["throttled"] += 1
                 return
-            if not self.hs_slots.acquire(blocking=False):
-                self.stats["busy"] += 1
-                return
             try:
-                raw.settimeout(HELLO_TIMEOUT)
-                tls = self.sctx.wrap_socket(raw, server_side=True)
-                check_tls(tls)
-                h = self.check_hello(recv_frame(tls))
-                send_frame(tls, self.hello())
-            except Exception:  # noqa: BLE001 - every pre-auth failure is quiet
-                with self.state:
-                    self.throttle.fail(ip)
-                self.stats["auth_fail"] += 1
-                return
+                if not self.hs_slots.acquire(blocking=False):
+                    self.stats["busy"] += 1
+                    return
+                try:
+                    raw.settimeout(HELLO_TIMEOUT)
+                    tls = self.sctx.wrap_socket(raw, server_side=True, do_handshake_on_connect=False)
+                    self.arm(tls)
+                    tls.do_handshake()
+                    check_tls(tls)
+                    h = self.check_hello(recv_frame(tls), ip)
+                    send_frame(tls, self.hello())
+                except Exception:  # noqa: BLE001 - every pre-auth failure is quiet
+                    with self.state:
+                        self.throttle.fail(ip)
+                    self.stats["auth_fail"] += 1
+                    return
+                finally:
+                    self.disarm(tls)
+                    self.hs_slots.release()
             finally:
-                self.hs_slots.release()
+                with self.state:
+                    self.inflight[ip] -= 1
+                    if self.inflight[ip] <= 0:
+                        del self.inflight[ip]
             host = h["host"]
             with self.state:
                 self.throttle.ok(ip)
@@ -1117,10 +1204,7 @@ class Relay:
             if old is not None:
                 if old[0] != h["node"]:
                     log(f"host label {host} now comes from a different node; the newest wins")
-                try:
-                    old[1].shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+                kick(old[1])
             self.add_candidate((ip, h["port"]), "dialback")
             self.stats["auth_ok"] += 1
             tls.settimeout(max(60.0, 3 * self.conf["keepalive"]))
@@ -1186,7 +1270,8 @@ class Relay:
             up = sorted(self.by_host)
             inbound = sorted(self.inbound)
         return {"ok": True, "host": self.host, "fingerprint": self.fp, "ip": self.ip, "port": self.port,
-                "outbound": up, "inbound": inbound, "skew": dict(self.skew), "stats": dict(self.stats)}
+                "outbound": up, "inbound": inbound, "skew": dict(self.skew), "stats": dict(self.stats),
+                "clash": sorted(ip for ip, t in self.clash.items() if time.time() - t < 600)}
 
     def op_send(self, req):
         deadline = req.get("deadline") if isinstance(req.get("deadline"), (int, float)) else time.time() + RELAY_WAIT
@@ -1248,7 +1333,7 @@ class Relay:
             if resp is None:
                 err = f"{host} stopped answering; #{mid} may not have arrived"
                 if late:
-                    self.notice(me, kind, f"your {kind} #{mid} to {call} is unconfirmed: {err}")
+                    self.notice(me, kind, f"your {kind} #{mid} to {call} is unconfirmed: {err}", host)
                 return {"ok": False, "error": f"unconfirmed: {err}"}
             r = resp.get("r") if resp.get("t") == "ack" and resp.get("gid") == gid else "rej"
             if r not in ("woke", "quiet", "dup"):
@@ -1257,9 +1342,9 @@ class Relay:
                     core.db().execute("DELETE FROM messages WHERE id=?", (mid,))
                     core.db().execute("DELETE FROM net_msgs WHERE gid=?", (gid,))
                 if late:
-                    self.notice(me, kind, f"your {kind} to {call} was not delivered: {why}")
+                    self.notice(me, kind, f"your {kind} to {call} was not delivered: {why}", host)
                 return {"ok": False, "error": f"not delivered to {call}: {why}"}
-            woke = r == "woke"
+            woke = r == "woke" or (r == "dup" and resp.get("woke") is True)
             if want and r == "quiet" and not note:
                 note = {"dnd": f" ({call} is do-not-disturb)",
                         "rate": " (wake rate limit: delivered quietly)",
@@ -1434,6 +1519,7 @@ class Relay:
                         code = 3
                         break
                 self.dial()
+                self.kick_overdue()
                 self.stop.wait(0.25)
         finally:
             self.shutdown()
@@ -1480,6 +1566,8 @@ class Relay:
         for p in peers:
             p.retired = True
             p.close()
+        for s in inbound:
+            kick(s)
         for s in inbound + self.socks:
             try:
                 s.close()
@@ -1643,6 +1731,9 @@ def _cli(a):
                   f"inbound {', '.join(st['inbound']) or 'none'}")
             for h, s in (st.get("skew") or {}).items():
                 print(f"clock skew: {h} is {s:+.0f} s off (limit {HELLO_SKEW} s)")
+            for ip in st.get("clash") or []:
+                print(f"label clash: the relay at {ip} uses my host label '{cfg['host']}'; "
+                      "set a distinct \"host\" in net.json on one of them")
             if st.get("stats"):
                 print("counters: " + ", ".join(f"{k}={v}" for k, v in sorted(st["stats"].items())))
         except (OSError, ValueError, KeyError):

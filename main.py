@@ -168,6 +168,15 @@ def net():
     return _net["mod"]
 
 
+def remote():
+    """comms_net for a target that resolve() just returned as remote; a clear
+    error if networking was switched off in between."""
+    n = net()
+    if n is None:
+        raise ToolError("networking was just switched off; nothing was sent")
+    return n
+
+
 def primer(call):
     n = net()
     return PRIMER.format(call=call) + (n.PRIMER_NOTE if n else "")
@@ -751,7 +760,7 @@ def tool_send(me, args):
         return f"#{mid} broadcast to {', '.join(sent)} ({'woke them' if urgent else 'quiet: they see it next turn'})"
     target = resolve(to, me)
     if isinstance(target, dict):  # a session on another machine (comms_net)
-        return net().send(me, my, target, kind, text, parent, urgent)
+        return remote().send(me, my, target, kind, text, parent, urgent)
     thread = parent["thread"] if parent is not None else None
     hops = parent["hops"] + 1 if parent is not None else 0
     mid = store(me, my["call"], target["sid"], target["call"], kind, text, re_id, thread, hops)
@@ -861,7 +870,7 @@ def tool_watch(me, args):
     if args.get("peer"):
         target = resolve(args["peer"], me)
         if isinstance(target, dict):
-            return net().watch_peer(me, target)
+            return remote().watch_peer(me, target)
         busy = is_busy(target)
         db().execute("INSERT INTO watches(watcher, peer, created) VALUES (?,?,?)", (me, target["sid"], now()))
         return f"armed: you'll be woken when {target['call']} {'goes idle or ends' if busy else 'finishes its next turn or ends (idle now)'}"

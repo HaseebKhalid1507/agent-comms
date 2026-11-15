@@ -21,6 +21,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,39 @@ def relay_stats(base):
                 break
             buf += c
     return json.loads(buf)
+
+
+def tls_socketpair():
+    """A connected TLS 1.3 PSK pair (client, server) with the test key."""
+    psk = net.subkey(KEY, b"tls-psk")
+    srv = socket.create_server(("127.0.0.1", 0))
+    res = {}
+
+    def acc():
+        c, _ = srv.accept()
+        res["s"] = net.server_ctx(psk).wrap_socket(c, server_side=True)
+    t = threading.Thread(target=acc)
+    t.start()
+    cli = net.client_ctx(psk).wrap_socket(socket.create_connection(srv.getsockname(), timeout=5))
+    t.join(5)
+    srv.close()
+    res["s"].settimeout(5)
+    cli.settimeout(5)
+    return cli, res["s"]
+
+
+def keyed_hello(port, host="mallory", key=KEY):
+    """Can a client holding the key get through handshake + hello?"""
+    try:
+        with net.client_ctx(net.subkey(key, b"tls-psk")).wrap_socket(
+                socket.create_connection(("127.0.0.1", port), timeout=2)) as s:
+            s.settimeout(2)
+            net.check_tls(s)
+            net.send_frame(s, {"t": "hello", "v": 1, "node": secrets.token_hex(8), "host": host,
+                               "port": 1, "ts": time.time()})
+            return net.recv_frame(s).get("t") == "hello"
+    except (OSError, ssl.SSLError, ValueError, net.ProtocolError):
+        return False
 
 
 def audit_records(path):
@@ -233,26 +267,46 @@ class WireTest(unittest.TestCase):
     # frames
 
     def test_frame_round_trip_and_rejects(self):
-        a, b = socket.socketpair()
+        a, b = tls_socketpair()
         with a, b:
-            net.send_frame(a, {"t": "ping", "id": 1, "x": "ü"})
-            self.assertEqual(net.recv_frame(b), {"t": "ping", "id": 1, "x": "ü"})
+            net.send_frame(a, {"t": "ping", "id": 1, "x": "ü\ud800"})
+            self.assertEqual(net.recv_frame(b), {"t": "ping", "id": 1, "x": "ü\ud800"},
+                             "a lone surrogate doesn't break the codec")
             with self.assertRaises(net.ProtocolError):
                 net.send_frame(a, {"t": "x" * net.MAX_FRAME})
-            for bad in (b"\x00\x01\x00\x01", b"\x00\x00\x00\x00"):  # oversize, zero
-                a.sendall(bad)
-                with self.assertRaises(net.ProtocolError):
+        for bad, why in ((b"\x00\x01\x00\x01", "oversize"), (b"\x00\x00\x00\x00", "zero length"),
+                         (b"\x00\x00\x00\x03abc", "not JSON"), (b"\x00\x00\x00\x02[]", "not an object")):
+            a, b = tls_socketpair()
+            with a, b:
+                a.write(bad)
+                with self.assertRaises(net.ProtocolError, msg=why):
                     net.recv_frame(b)
-            a.sendall(b"\x00\x00\x00\x03abc")
-            with self.assertRaises(net.ProtocolError):
-                net.recv_frame(b)  # not JSON
-            a.sendall(b"\x00\x00\x00\x02[]")
-            with self.assertRaises(net.ProtocolError):
-                net.recv_frame(b)  # not an object
-            a.sendall(b"\x00\x00\x00\x10{}")
+        a, b = tls_socketpair()
+        with b:
+            a.write(b"\x00\x00\x00\x10{}")
             a.close()
-            with self.assertRaises(net.ProtocolError):
-                net.recv_frame(b)  # truncated
+            with self.assertRaises((net.ProtocolError, ssl.SSLError), msg="truncated"):
+                net.recv_frame(b)
+
+    def test_no_plaintext_path_once_tls_is_shut_down(self):
+        forged = json.dumps({"t": "msg", "gid": "0" * 32, "text": "forged"}).encode()
+        raw = struct.pack("!I", len(forged)) + forged
+        a, b = tls_socketpair()
+        with a, b:
+            socket.socket.sendall(a, raw)  # plaintext written under the TLS layer
+            time.sleep(0.1)
+            b.shutdown(socket.SHUT_RDWR)  # SSLSocket.shutdown drops the TLS object
+            with self.assertRaises(ValueError):
+                net.recv_frame(b)
+            with self.assertRaises(ValueError):
+                net.send_frame(b, {"t": "ping"})
+        c, d = tls_socketpair()
+        with c, d:
+            socket.socket.sendall(c, raw)
+            time.sleep(0.1)
+            net.kick(d)  # what the relay uses across threads: TLS stays in place
+            with self.assertRaises((net.ProtocolError, ssl.SSLError, OSError)):
+                net.recv_frame(d)
 
     # beacon
 
@@ -443,10 +497,38 @@ class WireTest(unittest.TestCase):
 
     # hello, hygiene
 
+    def test_overdue_handshakes_are_kicked(self):
+        r = self.relay()
+        a, b = tls_socketpair()
+        with a, b:
+            b.settimeout(30)
+            r.arm(b)
+            r.pending[id(b)] = (b, time.monotonic() - 1)  # past its deadline
+            out = {}
+
+            def read():
+                t = time.time()
+                try:
+                    net.recv_frame(b)
+                except Exception as e:  # noqa: BLE001
+                    out["err"] = e
+                out["took"] = time.time() - t
+            th = threading.Thread(target=read)
+            th.start()
+            time.sleep(0.2)
+            r.kick_overdue()
+            th.join(5)
+            self.assertIn("err", out)
+            self.assertLess(out["took"], 2)
+            self.assertEqual(r.stats["hs_deadline"], 1)
+            self.assertEqual(r.pending, {})
+
     def test_hello_rules(self):
         r = self.relay()
         h = {"t": "hello", "v": 1, "node": secrets.token_hex(8), "host": "bravo", "port": 4000, "ts": time.time()}
         self.assertEqual(r.check_hello(dict(h))["host"], "bravo")
+        self.assertRaises(net.ProtocolError, r.check_hello, dict(h, host="alpha"), "10.0.0.9")
+        self.assertIn("10.0.0.9", r.clash, "a peer using my host label is recorded for net status")
         for bad in ({"host": "alpha"}, {"host": "Bad Label"}, {"host": "user"}, {"node": r.node.hex()},
                     {"ts": time.time() + 400}, {"v": 2}, {"t": "msg"}, {"port": 0}, {"node": "zz"}):
             with self.assertRaises(net.ProtocolError, msg=bad):
@@ -550,7 +632,8 @@ class ReceiverTest(unittest.TestCase):
     def test_same_gid_twice_is_one_event(self):
         gid = secrets.token_hex(16)
         self.assertEqual(self.msg(gid=gid)["r"], "woke")
-        self.assertEqual(self.msg(gid=gid)["r"], "dup")
+        dup = self.msg(gid=gid)
+        self.assertEqual((dup["r"], dup["woke"]), ("dup", True), "a dup says whether the stored copy woke")
         tc.settle()
         self.assertEqual(len(self.T.events), 1)
         self.assertEqual(core.db().execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
@@ -727,6 +810,8 @@ class TwoMachines(unittest.TestCase):
         self.B.hook("on_message_complete", b.sid, message="done", data={"has_tool_use": False})
         self.assertTrue(wait_for(lambda: any("watch fired" in t for t in a.texts()), 6), a.texts())
         self.assertIn(f"watch fired: {b.call}@bravo is idle", a.texts()[-1])
+        self.assertEqual(a.events[-1]["sender"], {"id": "@bravo", "name": "agent-comms@bravo",
+                                                  "sender_type": "agent"}, "attributed to the machine")
 
     def test_remote_claim_watch(self):
         a, b = self.pair()
@@ -796,6 +881,11 @@ class TwoMachines(unittest.TestCase):
             con.close()
             corpus += [json.dumps(s.events) for s in m.sessions]
         blob = "\n".join(corpus)
+        remote_caused = [e for m in (self.A, self.B) for x in m.sessions for e in x.events
+                         if "@alpha" in e["content"]["text"] or "@bravo" in e["content"]["text"]]
+        self.assertTrue(remote_caused)
+        self.assertEqual({e["sender"]["sender_type"] for e in remote_caused}, {"agent"},
+                         "nothing another machine caused is ever attributed to the user")
         for s in SECRETS:
             self.assertNotIn(s, blob)
             self.assertNotIn(s.upper(), blob)
@@ -866,6 +956,7 @@ class LinkTests(unittest.TestCase):
         self.assertIn("nothing was sent", r)
         self.assertTrue(wait_for(lambda: f"@bravo" not in A.tool("comms_who", a.sid), 10))
         self.assertTrue(wait_for(lambda: any("lost contact with bravo" in t for t in a.texts()), 5), a.texts())
+        self.assertEqual(a.events[-1]["sender"]["sender_type"], "agent")
         # Relay gone on alpha too: remote sessions vanish, sends fail at once.
         A.stop_relay()
         self.assertIn("relay isn't running", A.tool("comms_who", a.sid))
@@ -940,8 +1031,48 @@ class LinkTests(unittest.TestCase):
         self.assertIn("queued → slow@slowpoke", r)
         self.assertTrue(wait_for(lambda: any("unconfirmed" in t for t in a.texts()), 25), a.texts())
         self.assertIn("slowpoke stopped answering", a.texts()[-1])
+        self.assertEqual(a.events[-1]["sender"]["id"], "@slowpoke")
         self.assertGreaterEqual(len(got), 2, "retransmitted")
         self.assertEqual(len(set(got)), 1, "with the same gid")
+
+    def test_dribbling_handshakes_cant_lock_out_a_paired_machine(self):
+        pb = free_port()
+        B = self.machine("bravo", pb)
+        # At most 2 handshakes in flight per source address: the 3rd is dropped at once.
+        same = [socket.create_connection(("127.0.0.1", pb), source_address=("127.0.0.10", 0)) for _ in range(3)]
+        self.assertTrue(wait_for(lambda: B.stats()["stats"].get("throttled", 0) >= 1, 3))
+        for s in same:
+            s.close()
+        time.sleep(0.5)
+        # 8 keyless clients on 8 addresses take every handshake slot and dribble
+        # one byte a second, so no per-recv timeout ever fires.
+        dribblers = [socket.create_connection(("127.0.0.1", pb), source_address=(f"127.0.0.{i}", 0))
+                     for i in range(2, 10)]
+        stop = threading.Event()
+
+        def dribble():
+            hdr = b"\x16\x03\x01\x02\x00" + b"\x00" * 64
+            for i in range(len(hdr)):
+                for s in dribblers:
+                    try:
+                        s.send(hdr[i:i + 1])
+                    except OSError:
+                        pass
+                if stop.wait(1.0):
+                    return
+        t = threading.Thread(target=dribble, daemon=True)
+        t.start()
+        self.addCleanup(lambda: (stop.set(), t.join(5), [s.close() for s in dribblers]))
+        time.sleep(0.5)
+        self.assertFalse(keyed_hello(pb), "all slots are parked")
+        t0 = time.time()
+        self.assertTrue(wait_for(lambda: keyed_hello(pb), 8, 0.3), "a keyed client gets in after the deadline")
+        self.assertLess(time.time() - t0, 6.5)
+        # Either bound may fire first: CPython's do_handshake() treats the socket
+        # timeout as a deadline for the whole call, and the relay's own absolute
+        # deadline (kick_overdue, tested on its own) covers handshake + hello.
+        st = B.stats()["stats"]
+        self.assertGreaterEqual(st.get("hs_deadline", 0) + st.get("auth_fail", 0), 8, st)
 
     def test_recorded_session_replay_fails_and_duplicate_msg_is_one_event(self):
         pb = free_port()
