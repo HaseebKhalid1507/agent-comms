@@ -563,6 +563,17 @@ class WireTest(unittest.TestCase):
         self.assertNotIn("user", [s["call"] for s in out])
         self.assertLessEqual(len(out), net.MAX_SESSIONS)
 
+    def test_oversized_roster_degrades(self):
+        big = [{"sid": f"s{i}", "call": f"c{i}", "state": "busy", "since": 1.0, "doing": "ü" * 90,
+                "status": "ß" * 200, "claims": [], "dnd": False} for i in range(64)]
+        fit = net.fit_roster(big)
+        self.assertTrue(0 < len(fit) < 64)
+        self.assertEqual(fit, big[:len(fit)])
+        a, b = tls_socketpair()
+        with a, b:
+            net.send_frame(a, {"t": "roster", "id": 1, "now": time.time(), "sessions": fit})
+            self.assertEqual(len(net.recv_frame(b)["sessions"]), len(fit))
+
     def test_throttle_and_limiter(self):
         th = net.Throttle()
         for _ in range(5):

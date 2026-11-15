@@ -1,6 +1,6 @@
 {
   "name": "agent-comms",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Session awareness for Synaps: every live session sees the others (busy/idle, what they're doing, claims) and can message them. Asks wake the peer; FYIs arrive quietly.",
   "author": "Haseeb Khalid / Jawz",
   "license": "MIT",

@@ -380,6 +380,15 @@ def sanitize_remote(text):
     return "\n".join([lines[0]] + ["    | " + ln for ln in lines[1:]])
 
 
+def fit_roster(sessions):
+    """Cut sessions from the end until the roster frame fits: a roster that
+    is too big must degrade, never fail (a failing push drops the machine)."""
+    while sessions and len(json.dumps({"t": "roster", "id": 2 ** 53, "now": time.time(),
+                                       "sessions": sessions}, separators=(",", ":"))) > MAX_FRAME - 64:
+        sessions = sessions[:-1]
+    return sessions
+
+
 def valid_host(h):
     return isinstance(h, str) and bool(HOST_RE.match(h)) and h not in RESERVED
 
@@ -921,6 +930,7 @@ class Relay:
         self.inflight = collections.Counter()  # handshakes in progress per source IP (≤ 2)
         self.pending = {}                     # id(sock) -> (sock, absolute deadline)
         self.clash = {}                       # ip -> time a peer there used my host label
+        self.known = {p[0] for p in self.static}  # static peers + addresses that authenticated
         self.host_wakes = Window(*HOST_WAKES)
         self.host_inflow = Window(*HOST_INFLOW)
         self.roster_at = {}
@@ -1155,24 +1165,30 @@ class Relay:
         self.stats["msg_in"] += 1
         return ack("woke" if woke else "quiet", why)
 
+    def admit(self, ip):
+        """Pre-auth gate, run in the accept loop before any thread starts:
+        subnet (or static peer), throttle, ≤ 2 handshakes in flight per IP."""
+        if ip not in self.known and ipaddress.IPv4Address(ip) not in self.subnet:
+            self.stats["drop_subnet"] += 1
+            return False
+        with self.state:
+            if not self.throttle.allow(ip) or self.inflight[ip] >= 2:
+                self.stats["throttled"] += 1
+                return False
+            self.inflight[ip] += 1
+        return True
+
     def handle_conn(self, raw, addr):
+        """An admitted inbound connection (admit() counted it in flight)."""
         ip = addr[0]
         host = tls = None
         try:
-            if ip not in {p[0] for p in self.static} and ipaddress.IPv4Address(ip) not in self.subnet:
-                self.stats["drop_subnet"] += 1
-                return
-            with self.state:
-                allowed = self.throttle.allow(ip)
-                if allowed and self.inflight[ip] >= 2:
-                    allowed = False
-                if allowed:
-                    self.inflight[ip] += 1
-            if not allowed:
-                self.stats["throttled"] += 1
-                return
+            # Static peers and addresses that authenticated before skip the
+            # global slot limit, so keyless clients rotating addresses can't
+            # keep a paired machine out (the per-IP cap still applies).
+            slot = ip not in self.known
             try:
-                if not self.hs_slots.acquire(blocking=False):
+                if slot and not self.hs_slots.acquire(blocking=False):
                     self.stats["busy"] += 1
                     return
                 try:
@@ -1190,7 +1206,8 @@ class Relay:
                     return
                 finally:
                     self.disarm(tls)
-                    self.hs_slots.release()
+                    if slot:
+                        self.hs_slots.release()
             finally:
                 with self.state:
                     self.inflight[ip] -= 1
@@ -1199,6 +1216,8 @@ class Relay:
             host = h["host"]
             with self.state:
                 self.throttle.ok(ip)
+                if len(self.known) < 256:
+                    self.known.add(ip)
                 old = self.inbound.get(host)
                 self.inbound[host] = (h["node"], tls)
             if old is not None:
@@ -1223,7 +1242,7 @@ class Relay:
         except (OSError, ssl.SSLError, ValueError, ProtocolError):
             pass
         except Exception as e:  # noqa: BLE001
-            log("inbound error", type(e).__name__, e)
+            log("inbound error", type(e).__name__, repr(str(e))[:120])  # text may carry peer bytes
         finally:
             with self.state:
                 if host and self.inbound.get(host, (None, None))[1] is tls:
@@ -1431,6 +1450,9 @@ class Relay:
                 if self.stop.is_set():
                     return
                 continue
+            if not self.admit(addr[0]):
+                raw.close()
+                continue
             threading.Thread(target=self.handle_conn, args=(raw, addr), daemon=True).start()
 
     def unix_loop(self, srv):
@@ -1500,7 +1522,7 @@ class Relay:
                 if t >= nxt["roster"]:
                     nxt["roster"] = t + 1
                     with self.lock:
-                        sessions = self.local_roster()
+                        sessions = fit_roster(self.local_roster())
                     self.roster = (sessions, core.canon(sessions))
                 if t >= nxt["expire"]:
                     nxt["expire"] = t + 2

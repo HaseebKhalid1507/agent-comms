@@ -2,7 +2,7 @@
 """agent-comms — session awareness and messaging for Synaps (placeholder name).
 
 Synaps process extension (JSON-RPC over stdio, Content-Length framing) and a
-small CLI for humans (`main.py who|send|log`). Stdlib only. See DESIGN.md.
+small CLI for humans (`main.py who|send|log|net|relay`). Stdlib only. See DESIGN.md.
 """
 import hashlib
 import json
