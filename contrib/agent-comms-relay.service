@@ -1,0 +1,23 @@
+# agent-comms LAN relay (opt-in). One per machine, per user.
+# Does nothing unless ~/.synaps-cli/agent-comms/net.json has "enabled": true
+# and ~/.synaps-cli/agent-comms/net.key exists (mode 600). See README.
+#
+#   systemctl --user enable --now ~/.synaps-cli/plugins/agent-comms/contrib/agent-comms-relay.service
+#   journalctl --user -u agent-comms-relay -f
+[Unit]
+Description=agent-comms LAN relay (opt-in)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.synaps-cli/plugins/agent-comms/main.py relay
+# 0 = networking off / another relay runs / stopped: stay down.
+# 2 = config or key problem: stay down until fixed. 3 = interface changed: restart.
+Restart=on-failure
+RestartSec=15
+RestartPreventExitStatus=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
