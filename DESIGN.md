@@ -53,6 +53,14 @@ changed. Activity churn (`doing`) never triggers it. Most turns inject
 nothing. Session start appends a ~60-token primer to the system prompt once
 (cache-stable); sessions that predate the plugin get it once via the digest.
 
+On a core that lists `inject.forget` in the `initialize` params' `features`,
+the digest is sent as `parts`: the primer and quiet messages are saved in the
+conversation (the model can refer back to them), the roster line
+(`[comms] peers: …` / `[comms] no other live sessions`) is `forget`: shown for
+this turn, then replaced by the core's marker, since it is stale a turn later.
+`content` still carries the whole digest, which is all an older core reads;
+on such a core the result is exactly what it was before.
+
 ## Sources of truth
 
 - **Liveness:** the session run registry (`<base>/run/*.json`) plus a pid
