@@ -2,6 +2,11 @@
 
 ## 0.2.0 (unreleased)
 
+- **Saved digests on cores with `inject.forget`.** When the core lists
+  `inject.forget` in `initialize` `features`, the `before_message` digest
+  also carries `parts`: the primer and quiet messages are saved, the roster
+  line is shown for one turn only. `content` is unchanged, and on a core
+  without the feature the result is byte-for-byte what it was.
 - **Across machines, opt-in.** Sessions on paired machines on the same LAN
   show up as `call@host` in `comms_who` and the digest; `comms_send` and
   `comms_watch` reach them, and replies route back on their own. Off by

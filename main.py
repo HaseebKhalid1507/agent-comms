@@ -32,6 +32,7 @@ CONFIG = {
     "claim_ttl_s": 7200,
 }
 PLUGIN_ID = "agent-comms"
+INJECT_FORGET = False  # the core lists "inject.forget" in initialize features
 HUMAN = "user"  # callsign for the human CLI (`main.py send`)
 MAX_TEXT = 2000
 
@@ -524,10 +525,7 @@ def on_hook(ev):
         elif CONFIG["share_prompts"]:
             prompt = short(msg, 160)
         set_peer(sid, state="busy", turn_at=t, last_seen=t, prompt=prompt)
-        digest = build_digest(sid)
-        if digest:
-            return {"action": "inject", "content": digest}
-        return {"action": "continue"}
+        return digest_result(digest_parts(sid))
     if kind == "before_tool_call":
         name = ev.get("tool_runtime_name") or ev.get("tool_name") or ""
         inp = ev.get("tool_input")
@@ -578,12 +576,36 @@ def after_edit(sid, row, ev):
     return {"action": "replace", "output": out + warn}
 
 
+def digest_result(parts):
+    """HookResult for a digest given as [(text, forget)]. `content` is the whole
+    text, as before inject.forget; a core with it also gets `parts`: notes and
+    the primer are saved, the roster line is shown for this turn only."""
+    if not parts:
+        return {"action": "continue"}
+    result = {"action": "inject", "content": "\n".join(t for t, _ in parts)}
+    if INJECT_FORGET:
+        merged = []
+        for text, forget in parts:
+            if merged and merged[-1]["forget"] == forget:
+                merged[-1]["content"] += "\n" + text
+            else:
+                merged.append({"content": text, "forget": forget})
+        result["parts"] = [m if m["forget"] else {"content": m["content"]} for m in merged]
+    return result
+
+
 def build_digest(sid):
+    """The digest as one text, as an old core shows it; "" when nothing changed."""
+    return "\n".join(t for t, _ in digest_parts(sid))
+
+
+def digest_parts(sid):
+    """[(text, forget)] in display order; empty when nothing changed."""
     row = peer(sid)
     live = live_sessions()
     lines = []
     if not row["primer"]:
-        lines.append(primer(row["call"]))
+        lines.append((primer(row["call"]), False))
         set_peer(sid, primer=1)
     others = [r for r in db().execute("SELECT * FROM peers WHERE gone IS NULL ORDER BY call").fetchall()
               if r["sid"] in live and r["sid"] != sid]
@@ -595,17 +617,17 @@ def build_digest(sid):
         set_peer(sid, digest=sig)
         if others or remote:
             cards = [card(r, live) for r in others] + [n.card(r) for r in remote]
-            lines.append("[comms] peers: " + "; ".join(c.replace("\n    ", " · ") for c in cards))
+            lines.append(("[comms] peers: " + "; ".join(c.replace("\n    ", " · ") for c in cards), True))
         elif row["digest"] is not None:
-            lines.append("[comms] no other live sessions")
+            lines.append(("[comms] no other live sessions", True))
     unread = db().execute(
         "SELECT * FROM messages WHERE to_sid=? AND read_at IS NULL AND woke=0 ORDER BY id LIMIT 6",
         (sid,),
     ).fetchall()
     for m in unread:
-        lines.append(fmt_msg(m, quiet=True))
+        lines.append((fmt_msg(m, quiet=True), False))
         db().execute("UPDATE messages SET read_at=? WHERE id=?", (now(), m["id"]))
-    return "\n".join(lines)
+    return lines
 
 
 def fmt_msg(m, quiet=False):
@@ -927,7 +949,7 @@ def write_message(payload):
 
 
 def serve():
-    global PLUGIN_ID
+    global PLUGIN_ID, INJECT_FORGET
     stdin = sys.stdin.buffer
     while True:
         msg = read_message(stdin)
@@ -939,6 +961,8 @@ def serve():
         try:
             if method == "initialize":
                 PLUGIN_ID = params.get("plugin_id") or PLUGIN_ID
+                features = params.get("features")
+                INJECT_FORGET = isinstance(features, list) and "inject.forget" in features
                 for k, v in (params.get("config") or {}).items():
                     if k in CONFIG and v not in (None, ""):
                         CONFIG[k] = type(CONFIG[k])(v) if not isinstance(CONFIG[k], bool) else str(v).lower() in ("1", "true", "yes", "on")

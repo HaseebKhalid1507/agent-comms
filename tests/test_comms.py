@@ -336,5 +336,105 @@ class CommsTest(unittest.TestCase):
         self.assertLess(per, 5.0)
 
 
+class DigestPartsTest(unittest.TestCase):
+    """before_message digest on a core with and without inject.forget. Session C
+    never ran on_session_start, so its first digest carries the primer."""
+    FEATURES = None  # None: the key is left out of initialize, as on an old core
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="agent-comms-test-")
+        os.makedirs(os.path.join(self.base, "run"))
+        os.makedirs(os.path.join(self.base, "sessions"))
+        self.A = FakeSession(self.base, "20261014-000001-aaaa")
+        self.C = FakeSession(self.base, "20261014-000003-cccc")
+        self.pl = Plugin(self.base)
+        params = {"plugin_id": "agent-comms", "plugin_root": ROOT, "config": {"base_dir": self.base}}
+        if self.FEATURES is not None:
+            params["features"] = self.FEATURES
+        self.pl.call("initialize", params)
+        self.callA = self.pl.hook("on_session_start", self.A.sid)["content"].split("'")[1]
+
+    def tearDown(self):
+        self.pl.close()
+        for s in (self.A, self.C):
+            s.srv.close()
+        shutil.rmtree(self.base, ignore_errors=True)
+
+    def first_digest(self):
+        self.assertIn("quiet", self.pl.tool("comms_send", self.A.sid, to="cccc", text="FYI pushed PR #226"))
+        return self.pl.hook("before_message", self.C.sid, message="hi")
+
+    def check_old(self, d):
+        self.assertEqual(set(d), {"action", "content"})
+        self.assertEqual(d["action"], "inject")
+        lines = d["content"].split("\n")
+        self.assertIn("You are '", d["content"])
+        peers = [i for i, l in enumerate(lines) if l.startswith("[comms] peers: ")]
+        note = [i for i, l in enumerate(lines) if "FYI pushed PR #226" in l]
+        self.assertEqual(len(peers), 1)
+        self.assertIn(self.callA, lines[peers[0]])
+        self.assertTrue(peers[0] < note[0] == len(lines) - 1, lines)
+
+    def test_old_core_gets_todays_result(self):
+        self.check_old(self.first_digest())
+        self.A.kill()
+        self.pl.hook("on_session_end", self.A.sid)
+        self.assertEqual(self.pl.hook("before_message", self.C.sid, message="again"),
+                         {"action": "inject", "content": "[comms] no other live sessions"})
+        self.assertEqual(self.pl.hook("before_message", self.C.sid, message="more"), {"action": "continue"})
+
+
+class DigestPartsUnknownFeaturesTest(DigestPartsTest):
+    FEATURES = ["something.else"]
+
+
+class DigestPartsMalformedFeaturesTest(DigestPartsTest):
+    FEATURES = "inject.forget"  # not a list: ignored
+
+
+class DigestPartsForgetTest(DigestPartsTest):
+    FEATURES = ["something.else", "inject.forget"]
+
+    def test_old_core_gets_todays_result(self):
+        pass
+
+    def test_parts_saved_primer_and_notes_forget_roster(self):
+        d = self.first_digest()
+        self.assertEqual(d["action"], "inject")
+        primer, peers, note = d["parts"]
+        self.assertEqual(set(primer), {"content"})
+        self.assertIn("You are '", primer["content"])
+        self.assertEqual(peers["forget"], True)
+        self.assertTrue(peers["content"].startswith("[comms] peers: "), peers)
+        self.assertNotIn("\n", peers["content"])
+        self.assertIn(self.callA, peers["content"])
+        self.assertEqual(set(note), {"content"})
+        self.assertIn("FYI pushed PR #226", note["content"])
+        # content is the fallback: exactly what an old core gets
+        self.assertEqual(d["content"], "\n".join(p["content"] for p in d["parts"]))
+        self.check_old({"action": d["action"], "content": d["content"]})
+
+    def test_notes_alone_are_one_saved_part(self):
+        self.first_digest()
+        self.pl.tool("comms_send", self.A.sid, to="cccc", text="one")
+        self.pl.tool("comms_send", self.A.sid, to="cccc", text="two")
+        d = self.pl.hook("before_message", self.C.sid, message="next")
+        self.assertEqual(len(d["parts"]), 1)
+        self.assertEqual(set(d["parts"][0]), {"content"})
+        self.assertEqual(d["parts"][0]["content"], d["content"])
+        self.assertIn("one", d["content"])
+        self.assertIn("two", d["content"])
+
+    def test_no_other_live_sessions_is_forget(self):
+        self.first_digest()
+        self.A.kill()
+        self.pl.hook("on_session_end", self.A.sid)
+        self.assertEqual(self.pl.hook("before_message", self.C.sid, message="again"),
+                         {"action": "inject", "content": "[comms] no other live sessions",
+                          "parts": [{"content": "[comms] no other live sessions", "forget": True}]})
+        self.assertEqual(self.pl.hook("before_message", self.C.sid, message="more"), {"action": "continue"})
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
